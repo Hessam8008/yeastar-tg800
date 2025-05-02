@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\TG800\Yeastar.csproj" />
+    <ProjectReference Include="..\Yeastar\Yeastar.csproj" />
   </ItemGroup>
 
 </Project>

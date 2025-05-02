@@ -10,24 +10,38 @@ namespace Yeastar;
 /// </summary>
 public class TG800
 {
+    #region  Events
+    // Args
     public record OnMessageReceivedEventArgs(GsmPort Port, GsmMessage Message);
+    public record OnStoppedEventArgs(string Cause);
 
-    private const int ReadBufferSize = 1024;
-    private const string EndOfMessage = "\r\n\r\n";
-    private TcpClient? _tcpClient;
-    private string _username, _password;
-    private readonly YeastarResponseResolver _resolver;
-    private CancellationTokenSource? _readingCancellationTokenSource;
-    private readonly byte[] _readingBuffer = new byte[ReadBufferSize];
-    private readonly Dictionary<int, List<GsmMessage>> _messages = new();
+    // Event handlers
     public event EventHandler<OnMessageReceivedEventArgs>? OnMessageReceived;
     public event EventHandler? OnLoginFailed;
+    public event EventHandler<OnStoppedEventArgs> OnStopped;
+    #endregion
 
+    #region Fields
+    private const int ReadBufferSize = 1024;
+    private const string EndOfMessage = "\r\n\r\n";
+    private string _username, _password;
+    private TcpClient? _tcpClient;
+    private CancellationTokenSource? _readingCancellationTokenSource;
+    private readonly YeastarResponseResolver _resolver;
+    private readonly byte[] _readingBuffer = new byte[ReadBufferSize];
+    private readonly Dictionary<int, List<GsmMessage>> _messages = new();
+    #endregion
+
+    #region Properties
     public string IP { get; private set; }
     public int Port { get; private set; }
     public bool IsConnected { get; private set; }
     public List<GsmPort> Ports { get; } = [];
+    #endregion
 
+    /// <summary>
+    /// Ctor
+    /// </summary>
     public TG800()
     {
         _resolver = new YeastarResponseResolver();
@@ -37,6 +51,143 @@ public class TG800
         _resolver.NewMessageEvent += (s, e) => NewMessageReceived(e);
         _resolver.Setup();
     }
+
+    public async Task ConnectAsync(string ip, int port, CancellationToken cancellationToken = default)
+    {
+        if (IsConnected)
+            throw new Exception("Device is already connected. Disconnect the device and try again.");
+
+        var ipAddress = IPAddress.Parse(ip);
+        var ipEndPoint = new IPEndPoint(ipAddress, port);
+        _tcpClient = new TcpClient();
+        await _tcpClient.ConnectAsync(ipEndPoint, cancellationToken);
+        IP = ip;
+        Port = port;
+        IsConnected = true;
+    }
+
+    public async Task StartAsync()
+    {
+        _readingCancellationTokenSource = new CancellationTokenSource();
+        var cancellationToken = _readingCancellationTokenSource.Token;
+        _ = ListeningAsync(cancellationToken);
+        await Task.Delay(200, cancellationToken);
+    }
+
+    public async Task LoginAsync(string userName, string password)
+    {
+        _username = userName;
+        _password = password;
+
+        var command = YeastarCommands.GenerateLoginCommand(userName, password);
+
+        await WriteAsync(command);
+    }
+
+    public void Stop()
+    {
+        _readingCancellationTokenSource?.Cancel(true);
+    }
+
+    public Task GetStatusAsync()
+        => WriteAsync(YeastarCommands.StatusCommand);
+
+    public Task GetStatusAsync(int portNumber)
+    {
+        var command = YeastarCommands.GenerateSpanStatusCommand(portNumber + 1);
+        return WriteAsync(command);
+    }
+
+    public async Task<string> SendSmsAsync(int portNumber, string destination, string message, string smsId)
+    {
+        var query = HttpUtility.ParseQueryString(string.Empty);
+        query.Add("account", _username);
+        query.Add("password", _password);
+        query.Add("port", portNumber.ToString());
+        query.Add("destination", destination);
+        query.Add("content", message);
+        var url = $"http://{IP}/cgi/WebCGI?1500101={query}";
+        var uri = new Uri(url);
+
+        Console.WriteLine(url);
+
+        var result =
+           await uri.SendAsync(HttpMethod.Get, HttpVersion.Version11, default);
+
+        return result;
+    }
+
+    #region Reading and writing
+    private async Task ListeningAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            Console.WriteLine("Start listening...");
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                Console.WriteLine("Waiting...");
+                await ReadAsync(cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            OnStopped?.Invoke(this, new OnStoppedEventArgs("Cancelled."));
+        }
+        catch (IOException ex)
+        {
+            OnStopped?.Invoke(this, new OnStoppedEventArgs(ex.Message));
+        }
+        catch (Exception e)
+        {
+            OnStopped?.Invoke(this, new OnStoppedEventArgs(e.Message));
+        }
+        finally
+        {
+            IsConnected = false;
+        }
+    }
+
+    private async Task WriteAsync(string command)
+    {
+        var stream = _tcpClient?.GetStream()
+                     ?? throw new InvalidOperationException("TCP client is not connected.");
+
+        //Console.WriteLine(command);
+
+        var memory = new ReadOnlyMemory<byte>(Encoding.UTF8.GetBytes(command));
+        await stream.WriteAsync(memory);
+        await Task.Delay(200);
+    }
+
+    private async Task ReadAsync(CancellationToken cancellationToken = default)
+    {
+        var stream = _tcpClient?.GetStream()
+                     ?? throw new InvalidOperationException("TCP client is not connected.");
+        string text;
+        var response = new StringBuilder();
+
+        do
+        {
+            var readCount = await stream.ReadAsync(_readingBuffer, 0, ReadBufferSize, cancellationToken);
+
+            text = Encoding.UTF8.GetString(_readingBuffer, 0, readCount);
+
+            response.Append(text);
+            if (text.Equals("Response: Error\r\n", StringComparison.InvariantCultureIgnoreCase))
+            {
+                OnLoginFailed?.Invoke(this, default!);
+                return;
+            }
+        } while (!cancellationToken.IsCancellationRequested && !text.EndsWith(EndOfMessage));
+
+        Console.WriteLine($">>START>>\n{response}\n<<END<<");
+        var result = response.ToString();
+        response.Clear();
+        _resolver.Resolve(result);
+    }
+    #endregion
+
+    #region Resolver handlers
 
     private void UpdateStatus(YeastarResult result)
     {
@@ -105,136 +256,6 @@ public class TG800
         list.Clear();
         _messages.Remove(msg.ID);
     }
+    #endregion
 
-    public async Task ConnectAsync(string ip, int port, CancellationToken cancellationToken = default)
-    {
-        if (IsConnected)
-            throw new Exception("Device is already connected. Disconnect the device and try again.");
-
-        var ipAddress = IPAddress.Parse(ip);
-        var ipEndPoint = new IPEndPoint(ipAddress, port);
-        _tcpClient = new TcpClient();
-        await _tcpClient.ConnectAsync(ipEndPoint, cancellationToken);
-        IP = ip;
-        Port = port;
-        IsConnected = true;
-    }
-
-    public async Task StartAsync()
-    {
-        _readingCancellationTokenSource = new CancellationTokenSource();
-        var cancellationToken = _readingCancellationTokenSource.Token;
-        _ = ListeningAsync(cancellationToken);
-        await Task.Delay(200, cancellationToken);
-    }
-
-    public async Task LoginAsync(string userName, string password)
-    {
-        _username = userName;
-        _password = password;
-
-        var command = YeastarCommands.GenerateLoginCommand(userName, password);
-
-        await WriteAsync(command);
-        //var response = await ReadAsync();
-
-        //response.IsAuthenticated();
-    }
-
-    public void Stop()
-    {
-        _readingCancellationTokenSource?.Cancel(true);
-    }
-
-    public Task GetStatusAsync()
-        => WriteAsync(YeastarCommands.StatusCommand);
-
-    public Task GetStatusAsync(int portNumber)
-    {
-        var command = YeastarCommands.GenerateSpanStatusCommand(portNumber + 1);
-        return WriteAsync(command);
-    }
-
-    public async Task<string> SendSmsAsync(int portNumber, string destination, string message, string smsId)
-    {
-        var query = HttpUtility.ParseQueryString(string.Empty);
-        query.Add("account", _username);
-        query.Add("password", _password);
-        query.Add("port", portNumber.ToString());
-        query.Add("destination", destination);
-        query.Add("content", message);
-        var url = $"http://{IP}/cgi/WebCGI?1500101={query}";
-        var uri = new Uri(url);
-
-        Console.WriteLine(url);
-
-        var result =
-           await uri.SendAsync(HttpMethod.Get, HttpVersion.Version11, default);
-
-        return result;
-    }
-
-    private async Task ListeningAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            Console.WriteLine("Start listening...");
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                Console.WriteLine("Waiting...");
-                await ReadAsync(cancellationToken);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            Console.WriteLine("Operation cancelled.");
-        }
-        catch (IOException)
-        {
-            Console.WriteLine("Device is disconnected.");
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine($"Listening error:\n{e.Message}");
-        }
-    }
-
-    private async Task WriteAsync(string command)
-    {
-        var stream = _tcpClient?.GetStream()
-                     ?? throw new InvalidOperationException("TCP client is not connected.");
-
-        //Console.WriteLine(command);
-
-        var memory = new ReadOnlyMemory<byte>(Encoding.UTF8.GetBytes(command));
-        await stream.WriteAsync(memory);
-        await Task.Delay(200);
-    }
-
-    private async Task ReadAsync(CancellationToken cancellationToken = default)
-    {
-        var stream = _tcpClient?.GetStream()
-                     ?? throw new InvalidOperationException("TCP client is not connected.");
-        string text;
-        var response = new StringBuilder();
-
-        do
-        {
-            var readCount = await stream.ReadAsync(_readingBuffer, 0, ReadBufferSize, cancellationToken);
-
-            text = Encoding.UTF8.GetString(_readingBuffer, 0, readCount);
-
-            response.Append(text);
-            if (text.Equals("Response: Error\r\n", StringComparison.InvariantCultureIgnoreCase))
-            {
-                OnLoginFailed?.Invoke(this, default!);
-                return;
-            }
-        } while (!text.EndsWith(EndOfMessage));
-
-        Console.WriteLine($">>START>>\n{response}\n<<END<<");
-        var result = response.ToString();
-        response.Clear();
-        _resolver.Resolve(result);
-    }
 }

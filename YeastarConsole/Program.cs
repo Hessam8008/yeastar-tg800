@@ -8,6 +8,10 @@ Console.WriteLine("Hello, World!");
 var tg = new TG800();
 tg.OnLoginFailed += TgOnLoginFailed;
 tg.OnMessageReceived += TgOnMessageReceived;
+tg.OnStopped += (s, e) =>
+{
+    Console.WriteLine($"Stopped: {e.Cause}");
+};
 
 try
 {

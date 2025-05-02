@@ -6,18 +6,8 @@ Console.WriteLine("Hello, World!");
 
 
 var tg = new TG800();
-tg.OnLoginFailed += Tg_OnLoginFailed;
-tg.OnMessageReceived += Tg_OnMessageReceived;
-
-void Tg_OnLoginFailed(object? sender, EventArgs e)
-{
-    Console.WriteLine("# Login failed #");
-}
-
-void Tg_OnMessageReceived(object? sender, TG800.OnMessageReceivedEventArgs args)
-{
-    Console.WriteLine("[NEW] {0} | {1}", args.Port.Port, args.Message.Message);
-}
+tg.OnLoginFailed += TgOnLoginFailed;
+tg.OnMessageReceived += TgOnMessageReceived;
 
 try
 {
@@ -67,3 +57,14 @@ tg.Stop();
 
 Console.WriteLine("Press any key to close...");
 Console.ReadKey();
+return;
+
+void TgOnMessageReceived(object? sender, TG800.OnMessageReceivedEventArgs args)
+{
+    Console.WriteLine("[NEW] P:{0} | From: {1} | Body: {2}", args.Port.Port, args.Message.Sender, args.Message.Message);
+}
+
+void TgOnLoginFailed(object? sender, EventArgs e)
+{
+    Console.WriteLine("# Login failed #");
+}
